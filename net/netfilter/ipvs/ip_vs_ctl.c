@@ -2981,6 +2981,7 @@ static const struct nla_policy ip_vs_svc_policy[IPVS_SVC_ATTR_MAX + 1] = {
 	[IPVS_SVC_ATTR_TIMEOUT]		= { .type = NLA_U32 },
 	[IPVS_SVC_ATTR_NETMASK]		= { .type = NLA_U32 },
 	[IPVS_SVC_ATTR_STATS]		= { .type = NLA_NESTED },
+	[IPVS_SVC_ATTR_DESTS]		= { .type = NLA_NESTED },
 };
 
 /* Policy used for attributes in nested attribute IPVS_CMD_ATTR_DEST */
@@ -3070,31 +3071,26 @@ nla_put_failure:
 	return -EMSGSIZE;
 }
 
-static int ip_vs_genl_fill_service(struct sk_buff *skb,
-				   struct ip_vs_service *svc)
+static int ip_vs_genl_put_service_attrs(struct sk_buff *skb,
+					struct ip_vs_service *svc)
 {
 	struct ip_vs_scheduler *sched;
 	struct ip_vs_pe *pe;
-	struct nlattr *nl_service;
 	struct ip_vs_flags flags = { .flags = svc->flags,
 				     .mask = ~0 };
 	struct ip_vs_kstats kstats;
 	char *sched_name;
 
-	nl_service = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_SERVICE);
-	if (!nl_service)
-		return -EMSGSIZE;
-
 	if (nla_put_u16(skb, IPVS_SVC_ATTR_AF, svc->af))
-		goto nla_put_failure;
+		return -EMSGSIZE;
 	if (svc->fwmark) {
 		if (nla_put_u32(skb, IPVS_SVC_ATTR_FWMARK, svc->fwmark))
-			goto nla_put_failure;
+			return -EMSGSIZE;
 	} else {
 		if (nla_put_u16(skb, IPVS_SVC_ATTR_PROTOCOL, svc->protocol) ||
 		    nla_put(skb, IPVS_SVC_ATTR_ADDR, sizeof(svc->addr), &svc->addr) ||
 		    nla_put_be16(skb, IPVS_SVC_ATTR_PORT, svc->port))
-			goto nla_put_failure;
+			return -EMSGSIZE;
 	}
 
 	sched = rcu_dereference_protected(svc->scheduler, 1);
@@ -3105,11 +3101,26 @@ static int ip_vs_genl_fill_service(struct sk_buff *skb,
 	    nla_put(skb, IPVS_SVC_ATTR_FLAGS, sizeof(flags), &flags) ||
 	    nla_put_u32(skb, IPVS_SVC_ATTR_TIMEOUT, svc->timeout / HZ) ||
 	    nla_put_be32(skb, IPVS_SVC_ATTR_NETMASK, svc->netmask))
-		goto nla_put_failure;
+		return -EMSGSIZE;
 	ip_vs_copy_stats(&kstats, &svc->stats);
 	if (ip_vs_genl_fill_stats(skb, IPVS_SVC_ATTR_STATS, &kstats))
-		goto nla_put_failure;
+		return -EMSGSIZE;
 	if (ip_vs_genl_fill_stats64(skb, IPVS_SVC_ATTR_STATS64, &kstats))
+		return -EMSGSIZE;
+
+	return 0;
+}
+
+static int ip_vs_genl_fill_service(struct sk_buff *skb,
+				   struct ip_vs_service *svc)
+{
+	struct nlattr *nl_service;
+
+	nl_service = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_SERVICE);
+	if (!nl_service)
+		return -EMSGSIZE;
+
+	if (ip_vs_genl_put_service_attrs(skb, svc))
 		goto nla_put_failure;
 
 	nla_nest_end(skb, nl_service);
@@ -3286,12 +3297,13 @@ static struct ip_vs_service *ip_vs_genl_find_service(struct netns_ipvs *ipvs,
 	return ret ? ERR_PTR(ret) : svc;
 }
 
-static int ip_vs_genl_fill_dest(struct sk_buff *skb, struct ip_vs_dest *dest)
+static int ip_vs_genl_fill_dest(struct sk_buff *skb, int container_type,
+				struct ip_vs_dest *dest)
 {
 	struct nlattr *nl_dest;
 	struct ip_vs_kstats kstats;
 
-	nl_dest = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_DEST);
+	nl_dest = nla_nest_start_noflag(skb, container_type);
 	if (!nl_dest)
 		return -EMSGSIZE;
 
@@ -3344,7 +3356,7 @@ static int ip_vs_genl_dump_dest(struct sk_buff *skb, struct ip_vs_dest *dest,
 	if (!hdr)
 		return -EMSGSIZE;
 
-	if (ip_vs_genl_fill_dest(skb, dest) < 0)
+	if (ip_vs_genl_fill_dest(skb, IPVS_CMD_ATTR_DEST, dest) < 0)
 		goto nla_put_failure;
 
 	genlmsg_end(skb, hdr);
@@ -3389,6 +3401,141 @@ static int ip_vs_genl_dump_dests(struct sk_buff *skb,
 
 nla_put_failure:
 	cb->args[0] = idx;
+
+out_err:
+	mutex_unlock(&__ip_vs_mutex);
+
+	return skb->len;
+}
+
+struct dump_services_dests_ctx {
+	int	idx_svc;
+	int	idx_dest;
+	int	start_svc;
+	int	start_dest;
+};
+
+static int ip_vs_genl_dump_service_dests(struct sk_buff *skb,
+					 struct netlink_callback *cb,
+					 struct netns_ipvs *ipvs,
+					 struct ip_vs_service *svc,
+					 struct dump_services_dests_ctx *ctx)
+{
+	void *hdr;
+	struct nlattr *nl_service;
+	struct nlattr *nl_dests;
+	struct ip_vs_dest *dest;
+	int ret = 0;
+
+	if (svc->ipvs != ipvs)
+		return 0;
+
+	if (++ctx->idx_svc <= ctx->start_svc)
+		return 0;
+
+	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid,
+			  cb->nlh->nlmsg_seq, &ip_vs_genl_family,
+			  NLM_F_MULTI, IPVS_CMD_NEW_SERVICE);
+	if (!hdr)
+		goto out_err;
+
+	nl_service = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_SERVICE);
+	if (!nl_service)
+		goto nla_put_failure;
+
+	if (ip_vs_genl_put_service_attrs(skb, svc))
+		goto nla_nested_failure;
+
+	nl_dests = nla_nest_start_noflag(skb, IPVS_SVC_ATTR_DESTS);
+	if (!nl_dests)
+		goto nla_nested_failure;
+
+	list_for_each_entry(dest, &svc->destinations, n_list) {
+		if (++ctx->idx_dest <= ctx->start_dest)
+			continue;
+		if (ip_vs_genl_fill_dest(skb, IPVS_DESTS_ATTR_DEST, dest) < 0) {
+			ctx->idx_svc--;
+			ctx->idx_dest--;
+			ret = -EMSGSIZE;
+			goto nla_nested_end;
+		}
+	}
+	ctx->idx_dest = 0;
+	ctx->start_dest = 0;
+
+nla_nested_end:
+	nla_nest_end(skb, nl_dests);
+	nla_nest_end(skb, nl_service);
+	genlmsg_end(skb, hdr);
+	return ret;
+
+nla_nested_failure:
+	nla_nest_cancel(skb, nl_service);
+
+nla_put_failure:
+	genlmsg_cancel(skb, hdr);
+
+out_err:
+	ctx->idx_svc--;
+	return -EMSGSIZE;
+}
+
+static int ip_vs_genl_dump_services_destinations(struct sk_buff *skb,
+						 struct netlink_callback *cb)
+{
+	struct dump_services_dests_ctx ctx = {
+		.idx_svc = 0,
+		.start_svc = cb->args[0],
+		.idx_dest = 0,
+		.start_dest = cb->args[1],
+	};
+	struct net *net = sock_net(skb->sk);
+	struct netns_ipvs *ipvs = net_ipvs(net);
+	struct ip_vs_service *svc = NULL;
+	struct nlattr *attrs[IPVS_CMD_ATTR_MAX + 1];
+	int i = cb->args[2];
+
+	mutex_lock(&__ip_vs_mutex);
+
+	if (nlmsg_parse_deprecated(cb->nlh, GENL_HDRLEN, attrs,
+				   IPVS_CMD_ATTR_MAX, ip_vs_cmd_policy,
+				   cb->extack) == 0) {
+		if (attrs[IPVS_CMD_ATTR_SERVICE]) {
+			svc = ip_vs_genl_find_service(ipvs,
+						      attrs[IPVS_CMD_ATTR_SERVICE]);
+			if (IS_ERR_OR_NULL(svc))
+				goto out_err;
+			ip_vs_genl_dump_service_dests(skb, cb, ipvs, svc, &ctx);
+			goto nla_put_failure;
+		}
+	}
+
+	for (; i < IP_VS_SVC_TAB_SIZE; i++) {
+		hlist_for_each_entry(svc, &ip_vs_svc_table[i], s_list) {
+			if (ip_vs_genl_dump_service_dests(skb, cb, ipvs,
+							  svc, &ctx))
+				goto nla_put_failure;
+		}
+		ctx.idx_svc = 0;
+		ctx.start_svc = 0;
+	}
+
+	for (; i < 2 * IP_VS_SVC_TAB_SIZE; i++) {
+		hlist_for_each_entry(svc,
+				     &ip_vs_svc_fwm_table[i - IP_VS_SVC_TAB_SIZE],
+				     f_list) {
+			if (ip_vs_genl_dump_service_dests(skb, cb, ipvs,
+							  svc, &ctx))
+				goto nla_put_failure;
+		}
+		ctx.idx_svc = 0;
+		ctx.start_svc = 0;
+	}
+
+nla_put_failure:
+	cb->args[0] = ctx.idx_svc;
+	cb->args[1] = ctx.idx_dest;
+	cb->args[2] = i;
 
 out_err:
 	mutex_unlock(&__ip_vs_mutex);
@@ -3990,6 +4137,12 @@ static const struct genl_small_ops ip_vs_genl_ops[] = {
 		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 		.flags	= GENL_ADMIN_PERM,
 		.doit	= ip_vs_genl_set_cmd,
+	},
+	{
+		.cmd	= IPVS_CMD_GET_SERVICE_DEST,
+		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
+		.flags	= GENL_ADMIN_PERM,
+		.dumpit	= ip_vs_genl_dump_services_destinations,
 	},
 };
 
